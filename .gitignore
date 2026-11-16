@@ -1,1 +1,5 @@
 tidal_session.json
+__pycache__/
+.vscode/
+*Copy*.html
+new_albums_2026.html
