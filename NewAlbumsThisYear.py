@@ -10,6 +10,9 @@ import tidalapi
 
 # How far back to collect releases. The page lets you narrow the range further.
 DAYS_BACK = 365
+# Upcoming releases are kept up to this many days ahead. TIDAL uses far-future
+# placeholder dates (e.g. 2500-12-31) for some releases, which are dropped.
+DAYS_AHEAD = 365
 
 session = tidalapi.Session()
 # First run: prints a URL to authorize in the browser, then saves the tokens to
@@ -30,6 +33,7 @@ def fetch_all(fetch, page_size=50):
 
 
 start_date = date.today() - timedelta(days=DAYS_BACK)
+end_date = date.today() + timedelta(days=DAYS_AHEAD)
 followed_artists = fetch_all(session.user.favorites.artists)
 
 print(f"Checking {len(followed_artists)} followed artists for releases since {start_date}...\n")
@@ -124,7 +128,7 @@ for artist in followed_artists:
         except Exception as e:
             print(f"Skipping {fetch.__name__} for {artist.name}: {e}")
     for album in releases:
-        if not (album.release_date and album.release_date.date() >= start_date):
+        if not (album.release_date and start_date <= album.release_date.date() <= end_date):
             continue
         main_artist = getattr(getattr(album, "artist", None), "name", None) or artist.name
         key = (
@@ -165,6 +169,11 @@ def entry_key(artist, name, kind):
 
 
 albums = load_existing(out_file)
+# Remove saved entries with implausible far-future dates (placeholders such as 2500-12-31)
+valid = [a for a in albums if a["date"] <= f"{end_date:%Y-%m-%d}"]
+if len(valid) < len(albums):
+    print(f"Removed {len(albums) - len(valid)} entries dated after {end_date}")
+albums = valid
 known_keys = {entry_key(a["artist"], a["album"], a["kind"]) for a in albums}
 known_links = {a.get("app_link") for a in albums}
 print(f"Loaded {len(albums)} existing releases from {out_file.name}\n")
@@ -250,7 +259,8 @@ const ALBUMS = __DATA__;
 const $ = id => document.getElementById(id);
 const dates = ALBUMS.map(a => a.date).sort();
 $("from").value = dates[0] || "";
-$("to").value = dates[dates.length - 1] || "";
+// Start with released albums only; move "To" forward to see upcoming releases
+$("to").value = new Date().toLocaleDateString("sv-SE");
 
 function fillSelect(id, values) {
   const sel = $(id);
