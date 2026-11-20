@@ -1,4 +1,6 @@
+import argparse
 import json
+import os
 import re
 import time
 import webbrowser
@@ -13,6 +15,17 @@ DAYS_BACK = 365
 # Upcoming releases are kept up to this many days ahead. TIDAL uses far-future
 # placeholder dates (e.g. 2500-12-31) for some releases, which are dropped.
 DAYS_AHEAD = 365
+
+parser = argparse.ArgumentParser(description="Build new_albums.html from followed TIDAL artists.")
+parser.add_argument(
+    "--fast",
+    action="store_true",
+    help="skip the genre backfill of existing releases and avoid slow MusicBrainz lookups "
+    "when LASTFM_API_KEY is set (without a key, only the MusicBrainz album lookup is used)",
+)
+FAST = parser.parse_args().fast
+# Releases without genres are retried at most once per this many days
+BACKFILL_RETRY_DAYS = 30
 
 session = tidalapi.Session()
 # First run: prints a URL to authorize in the browser, then saves the tokens to
@@ -56,21 +69,100 @@ def mb_get(url, params):
     return resp.json()
 
 
-def get_genres(artist_name, album_name):
-    """Look up the album's genres on MusicBrainz. TIDAL's API has no genre field.
+MB_ARTIST_URL = "https://musicbrainz.org/ws/2/artist"
+LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
+# Optional: set the LASTFM_API_KEY environment variable to enable the Last.fm fallback.
+LASTFM_KEY = os.environ.get("LASTFM_API_KEY", "")
+# Last.fm tag counts are normalised to 0-100; lower counts are mostly noise.
+LASTFM_MIN_COUNT = 20
+LASTFM_JUNK = {
+    "seen live", "favorites", "favourites", "favorite", "favourite", "albums i own",
+    "owned", "love", "loved", "awesome", "good", "best", "beautiful", "male vocalists",
+    "female vocalists", "female vocalist", "male vocalist", "singer-songwriter",
+    "under 2000 listeners", "spotify", "tidal", "new", "all", "check out", "usa", "uk",
+    "american", "british", "german", "french", "swedish", "canadian", "australian",
+}
 
-    Returns a list of genre names, or [] if no confident match is found.
-    """
-    try:
-        query = f'releasegroup:"{album_name}" AND artist:"{artist_name}"'
-        hits = mb_get(MB_URL, {"query": query, "limit": 1}).get("release-groups", [])
-        if not hits or hits[0].get("score", 0) < 90:
-            return []
-        group = mb_get(f"{MB_URL}/{hits[0]['id']}", {"inc": "genres"})
-        genres = sorted(group.get("genres", []), key=lambda g: -g.get("count", 0))
-        return [g["name"] for g in genres[:4]]
-    except Exception:
+
+def _clean_genres(names, limit=4):
+    """Title-case-insensitive de-duplication, keeping order."""
+    seen, out = set(), []
+    for n in names:
+        key = n.casefold().strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(n.strip())
+    return out[:limit]
+
+
+def _mb_genres(url):
+    """Genre names of one MusicBrainz entity, most-voted first."""
+    data = mb_get(url, {"inc": "genres"})
+    genres = sorted(data.get("genres", []), key=lambda g: -g.get("count", 0))
+    return [g["name"] for g in genres]
+
+
+def mb_album_genres(artist_name, album_name):
+    query = f'releasegroup:"{album_name}" AND artist:"{artist_name}"'
+    hits = mb_get(MB_URL, {"query": query, "limit": 1}).get("release-groups", [])
+    if not hits or hits[0].get("score", 0) < 90:
         return []
+    return _mb_genres(f"{MB_URL}/{hits[0]['id']}")
+
+
+def mb_artist_genres(artist_name):
+    hits = mb_get(MB_ARTIST_URL, {"query": f'artist:"{artist_name}"', "limit": 1}).get("artists", [])
+    if not hits or hits[0].get("score", 0) < 90:
+        return []
+    return _mb_genres(f"{MB_ARTIST_URL}/{hits[0]['id']}")
+
+
+def lastfm_tags(method, **params):
+    """Return filtered genre-like tags from a Last.fm *.getTopTags call."""
+    resp = requests.get(
+        LASTFM_URL,
+        params={"method": method, "api_key": LASTFM_KEY, "format": "json", "autocorrect": 1, **params},
+        headers=MB_HEADERS,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    tags = resp.json().get("toptags", {}).get("tag", [])
+    skip = {str(v).casefold() for v in params.values()}
+    return [
+        t["name"]
+        for t in tags
+        if int(t.get("count", 0)) >= LASTFM_MIN_COUNT
+        and t["name"].casefold() not in LASTFM_JUNK
+        and t["name"].casefold() not in skip
+        and not re.fullmatch(r"\d{2,4}s?", t["name"])
+    ]
+
+
+def get_genres(artist_name, album_name):
+    """Look up genres. TIDAL's API has no genre field.
+
+    Order: MusicBrainz album, Last.fm album, MusicBrainz artist, Last.fm artist.
+    In --fast mode MusicBrainz (1 request per second) is skipped when a Last.fm key is set.
+    Returns a list of genre names, or [] if nothing is found.
+    """
+    use_mb = not (FAST and LASTFM_KEY)
+    steps = []
+    if use_mb:
+        steps.append(lambda: mb_album_genres(artist_name, album_name))
+    if LASTFM_KEY:
+        steps.append(lambda: lastfm_tags("album.getTopTags", artist=artist_name, album=album_name))
+    if use_mb and not FAST:
+        steps.append(lambda: mb_artist_genres(artist_name))
+    if LASTFM_KEY:
+        steps.append(lambda: lastfm_tags("artist.getTopTags", artist=artist_name))
+    for step in steps:
+        try:
+            genres = _clean_genres(step())
+        except Exception:
+            continue
+        if genres:
+            return genres
+    return []
 
 
 def get_description(album):
@@ -199,12 +291,27 @@ for item in best.values():
             "date": f"{album.release_date:%Y-%m-%d}",
             "quality": item["quality"],
             "genres": get_genres(item["artist_name"], album.name),
+            "genres_checked": f"{date.today():%Y-%m-%d}",
             "description": get_description(album),
             "app_link": f"tidal://album/{album.id}",
             "web_link": f"https://tidal.com/browse/album/{album.id}",
             "cover": album.image(320) if album.cover else "",
         }
     )
+
+# Step 3: retry genres for saved releases that have none. Skipped in --fast mode, and
+# each release is retried at most once per BACKFILL_RETRY_DAYS.
+if not FAST:
+    retry_before = f"{date.today() - timedelta(days=BACKFILL_RETRY_DAYS):%Y-%m-%d}"
+    todo = [a for a in albums if not a.get("genres") and a.get("genres_checked", "") < retry_before]
+    if todo:
+        print(f"\nRetrying genres for {len(todo)} releases without genres...")
+    for a in todo:
+        # Strip the " (version)" suffix that was appended to the saved album name
+        base_name = re.sub(r"\s*\([^()]*\)$", "", a["album"]) if "(" in a["album"] else a["album"]
+        a["genres"] = get_genres(a["artist"], base_name)
+        a["genres_checked"] = f"{date.today():%Y-%m-%d}"
+        print(f"  {a['artist']} - {a['album']}: {', '.join(a['genres']) or 'still unknown'}")
 
 albums.sort(key=lambda a: a["date"], reverse=True)
 
