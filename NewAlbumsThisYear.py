@@ -165,6 +165,70 @@ def get_genres(artist_name, album_name):
     return []
 
 
+SPOTIFY_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+# Releases without a Spotify match are searched again after this many days
+# (new and upcoming releases often reach Spotify later).
+SPOTIFY_RETRY_DAYS = 7
+_spotify = {"token": "", "expires": 0.0, "disabled": not (SPOTIFY_ID and SPOTIFY_SECRET)}
+
+
+def _spotify_token():
+    if time.time() < _spotify["expires"]:
+        return _spotify["token"]
+    resp = requests.post(
+        "https://accounts.spotify.com/api/token",
+        data={"grant_type": "client_credentials"},
+        auth=(SPOTIFY_ID, SPOTIFY_SECRET),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _spotify["token"] = data["access_token"]
+    _spotify["expires"] = time.time() + data.get("expires_in", 3600) - 60
+    return _spotify["token"]
+
+
+def _norm(text):
+    return re.sub(r"[^0-9a-z]+", "", text.casefold())
+
+
+def get_spotify(artist_name, album_name):
+    """Return the open.spotify.com URL of the matching album, or '' if not found.
+
+    Needs the SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables
+    (free app at developer.spotify.com). Without them no lookup is done.
+    Returns None if the lookup could not run (so the release is not marked as checked).
+    """
+    if _spotify["disabled"]:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.spotify.com/v1/search",
+            params={"q": f'album:"{album_name}" artist:"{artist_name}"', "type": "album", "limit": 10},
+            headers={"Authorization": f"Bearer {_spotify_token()}"},
+            timeout=20,
+        )
+        if resp.status_code == 429:
+            print("Spotify rate limit reached, skipping further Spotify lookups this run.")
+            _spotify["disabled"] = True
+            return None
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Spotify lookup failed, skipping further lookups this run: {e}")
+        _spotify["disabled"] = True
+        return None
+    want_album, want_artist = _norm(album_name), _norm(artist_name)
+    for item in resp.json().get("albums", {}).get("items", []):
+        got = _norm(item["name"])
+        artists = [_norm(a["name"]) for a in item.get("artists", [])]
+        album_ok = got == want_album or got.startswith(want_album) or want_album.startswith(got)
+        artist_ok = any(a == want_artist or want_artist in a or a in want_artist for a in artists if a)
+        if album_ok and artist_ok:
+            return item["external_urls"]["spotify"]
+    return ""
+
+
 def get_description(album):
     """Return the TIDAL album review as plain text, or '' if none exists."""
     try:
@@ -293,6 +357,8 @@ for item in best.values():
             "genres": get_genres(item["artist_name"], album.name),
             "genres_checked": f"{date.today():%Y-%m-%d}",
             "description": get_description(album),
+            "spotify_link": get_spotify(item["artist_name"], album.name) or "",
+            "spotify_checked": f"{date.today():%Y-%m-%d}" if not _spotify["disabled"] else "",
             "app_link": f"tidal://album/{album.id}",
             "web_link": f"https://tidal.com/browse/album/{album.id}",
             "cover": album.image(320) if album.cover else "",
@@ -313,6 +379,26 @@ if not FAST:
         a["genres_checked"] = f"{date.today():%Y-%m-%d}"
         print(f"  {a['artist']} - {a['album']}: {', '.join(a['genres']) or 'still unknown'}")
 
+# Step 4: look for Spotify links of saved releases that have none yet
+if not _spotify["disabled"]:
+    spotify_retry_before = f"{date.today() - timedelta(days=SPOTIFY_RETRY_DAYS):%Y-%m-%d}"
+    todo = [a for a in albums if not a.get("spotify_link") and a.get("spotify_checked", "") < spotify_retry_before]
+    if todo:
+        print(f"\nLooking up Spotify links for {len(todo)} releases...")
+    found = 0
+    for a in todo:
+        base_name = re.sub(r"\s*\([^()]*\)$", "", a["album"]) if "(" in a["album"] else a["album"]
+        link = get_spotify(a["artist"], base_name)
+        if link is None:
+            break
+        a["spotify_link"] = link
+        a["spotify_checked"] = f"{date.today():%Y-%m-%d}"
+        found += bool(link)
+    if todo:
+        print(f"  Found {found} Spotify links.")
+elif not (SPOTIFY_ID and SPOTIFY_SECRET):
+    print("\nSet SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to add Spotify links.")
+
 albums.sort(key=lambda a: a["date"], reverse=True)
 
 # "</" is escaped so album text can never close the <script> tag
@@ -322,32 +408,109 @@ page = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1117" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">
 <title>New Albums</title>
+<script>
+  // Apply saved theme before first paint to avoid a flash
+  try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #fafafa; color: #222; }
-  .filters { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: center; padding: .75rem 1rem; margin-bottom: 1rem; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
-  .filters label { display: flex; gap: .35rem; align-items: center; }
-  .filters input[type=search] { min-width: 12rem; }
-  ul { list-style: none; padding: 0; }
-  li { display: flex; gap: 1rem; padding: 1rem; margin-bottom: 1rem; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
-  img { width: 160px; height: 160px; object-fit: cover; border-radius: 4px; flex-shrink: 0; }
-  h2 { margin: 0 0 .25rem; font-size: 1.2rem; }
-  .meta { color: #666; margin: 0 0 .5rem; }
-  .badge { display: inline-block; padding: 0 .5rem; border-radius: 1rem; background: #e8eefc; color: #234; font-size: .8rem; }
-  a { color: #0066cc; }
+  :root {
+    --bg: #f5f6fa; --surface: #fff; --surface-2: #eef0f6; --border: #dde1ea;
+    --text: #1b1e27; --muted: #6a7184; --accent: #4f46e5; --accent-soft: #e6e4fd;
+    --shadow: 0 1px 2px rgba(20,24,40,.06), 0 4px 16px rgba(20,24,40,.06);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1117; --surface: #181b24; --surface-2: #21252f; --border: #2b303c;
+    --text: #e8eaf1; --muted: #9097aa; --accent: #8b87ff; --accent-soft: #2a2858;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.35);
+    color-scheme: dark;
+  }
   @media (prefers-color-scheme: dark) {
-    body { background: #181818; color: #eee; }
-    .filters, li { background: #242424; border-color: #444; }
-    .meta { color: #aaa; }
-    .badge { background: #2c3a5a; color: #dde; }
-    a { color: #6db3ff; }
+    :root:not([data-theme="light"]) {
+      --bg: #0f1117; --surface: #181b24; --surface-2: #21252f; --border: #2b303c;
+      --text: #e8eaf1; --muted: #9097aa; --accent: #8b87ff; --accent-soft: #2a2858;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.35);
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 1240px; margin: 0 auto; padding: max(1.5rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) max(3rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left)); background: var(--bg); color: var(--text); line-height: 1.5; transition: background .2s, color .2s; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+  h1 { margin: 0; font-size: 1.6rem; letter-spacing: -.02em; }
+  #theme { width: 2.5rem; height: 2.5rem; border-radius: 50%; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 1.15rem; cursor: pointer; box-shadow: var(--shadow); }
+  #theme:hover { border-color: var(--accent); }
+  .filters { position: sticky; top: .5rem; z-index: 2; display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: center; padding: .85rem 1rem; margin-bottom: 1.25rem; background: color-mix(in srgb, var(--surface) 88%, transparent); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); }
+  .filters label { display: flex; gap: .4rem; align-items: center; font-size: .9rem; color: var(--muted); }
+  .filters input[type=checkbox] { accent-color: var(--accent); width: 1rem; height: 1rem; }
+  input[type=date], input[type=search], select { font: inherit; font-size: .9rem; padding: .35rem .6rem; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text); }
+  input:focus, select:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .filters input[type=search] { flex: 1; min-width: 12rem; }
+  #count { margin-left: auto; font-size: .9rem; color: var(--accent); }
+  ul { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr)); gap: 1rem; }
+  #filter-toggle, .filters .row-toggle { display: none; }
+  .filter-fields { display: contents; }
+  .empty { grid-column: 1 / -1; text-align: center; color: var(--muted); padding: 2rem 0; }
+  li { display: flex; gap: 1.1rem; padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); transition: transform .15s, border-color .15s; }
+  li:hover { transform: translateY(-2px); border-color: var(--accent); }
+  img { width: 160px; height: 160px; object-fit: cover; border-radius: 10px; flex-shrink: 0; background: var(--surface-2); }
+  h2 { margin: 0 0 .25rem; font-size: 1.15rem; line-height: 1.3; }
+  .meta { color: var(--muted); font-size: .85rem; margin: 0 0 .6rem; display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; }
+  .badge { padding: .1rem .6rem; border-radius: 1rem; background: var(--accent-soft); color: var(--accent); font-size: .75rem; font-weight: 600; }
+  .genres { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 .6rem; }
+  .genre { padding: .1rem .55rem; border-radius: 6px; background: var(--surface-2); font-size: .78rem; color: var(--muted); }
+  .desc { margin: 0 0 .7rem; font-size: .92rem; }
+  .links { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: auto; }
+  .links a { padding: .3rem .8rem; border-radius: 8px; border: 1px solid var(--border); color: var(--accent); text-decoration: none; font-size: .85rem; font-weight: 500; }
+  .links a:hover { background: var(--accent-soft); }
+  .links a.spotify { color: #1db954; }
+  .links a.spotify:hover { background: color-mix(in srgb, #1db954 15%, transparent); }
+  .body { display: flex; flex-direction: column; min-width: 0; }
+  .head { min-width: 0; }
+  /* Touch devices: larger tap targets, 16px inputs (stops iOS zoom on focus) */
+  @media (pointer: coarse) {
+    input[type=date], input[type=search], select { font-size: 16px; min-height: 2.6rem; }
+    .links a, #theme { min-height: 2.75rem; display: inline-flex; align-items: center; }
+    #theme { width: 2.75rem; justify-content: center; }
+    .filters input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
+    li:hover { transform: none; }
+  }
+  /* Tablet and phone */
+  @media (max-width: 700px) {
+    body { padding-top: max(.75rem, env(safe-area-inset-top)); }
+    h1 { font-size: 1.25rem; }
+    .filters { top: max(.25rem, env(safe-area-inset-top)); padding: .6rem .75rem; gap: .5rem; border-radius: 12px; }
+    .filters .row-toggle { display: inline-flex; align-items: center; gap: .4rem; }
+    #filter-toggle { display: inline-flex; padding: .35rem .8rem; min-height: 2.6rem; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text); font: inherit; cursor: pointer; }
+    #filter-toggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+    .filters input[type=search] { order: -1; flex: 1 1 100%; }
+    #count { order: -1; margin-left: auto; }
+    .filter-fields { display: none; flex-wrap: wrap; gap: .6rem 1rem; width: 100%; padding-top: .5rem; border-top: 1px solid var(--border); }
+    .filters.open .filter-fields { display: flex; }
+    .filter-fields label { flex: 1 1 45%; flex-direction: column; align-items: stretch; gap: .2rem; }
+    .filter-fields label:has(.kind) { flex: 0 0 auto; flex-direction: row; align-items: center; }
+    ul { grid-template-columns: 1fr; gap: .75rem; }
+    /* Compact card: small cover beside title, details span the full width */
+    li { display: grid; grid-template-columns: 96px 1fr; gap: .5rem .85rem; padding: .8rem; }
+    li .body { display: contents; }
+    img { width: 96px; height: 96px; border-radius: 8px; }
+    h2 { font-size: 1rem; }
+    .genres, .desc, .links { grid-column: 1 / -1; margin: 0; }
+    .links a { flex: 1; justify-content: center; text-align: center; }
   }
 </style>
 </head>
 <body>
-<h1>New albums from followed artists</h1>
+<header>
+  <h1>New albums from followed artists</h1>
+  <button id="theme" type="button" title="Toggle dark / light theme" aria-label="Toggle theme"></button>
+</header>
 <div class="filters">
+  <button type="button" id="filter-toggle" aria-expanded="false" aria-controls="filter-fields">Filters</button>
+  <div class="filter-fields" id="filter-fields">
   <label>From <input type="date" id="from"></label>
   <label>To <input type="date" id="to"></label>
   <label><input type="checkbox" class="kind" value="Album" checked> Albums</label>
@@ -357,6 +520,7 @@ page = """<!doctype html>
   <label>Year <select id="year"><option value="">All</option></select></label>
   <label>Artist <select id="artist"><option value="">All</option></select></label>
   <label>Genre <select id="genre"><option value="">All</option></select></label>
+  </div>
   <input type="search" id="q" placeholder="Search artist, album, genre">
   <strong id="count"></strong>
 </div>
@@ -398,24 +562,49 @@ function render() {
   $("count").textContent = shown.length + " of " + ALBUMS.length;
   const list = $("list");
   list.replaceChildren();
+  if (!shown.length) list.append(el("li", "No releases match these filters.", {class: "empty"}));
   for (const a of shown) {
     const li = el("li");
-    if (a.cover) li.append(el("img", "", {src: a.cover, alt: ""}));
-    const box = el("div");
-    box.append(el("h2", a.artist + " – " + a.album));
-    const meta = el("p", a.date.slice(0, 4) + " · released " + a.date + " · ", {class: "meta"});
+    if (a.cover) li.append(el("img", "", {src: a.cover, alt: "", loading: "lazy", decoding: "async"}));
+    const box = el("div", "", {class: "body"});
+    const head = el("div", "", {class: "head"});
+    head.append(el("h2", a.artist + " – " + a.album));
+    const meta = el("p", "", {class: "meta"});
     meta.append(el("span", a.kind, {class: "badge"}));
-    if (a.quality) meta.append(" · " + a.quality);
-    box.append(meta);
-    box.append(el("p", "Genre: " + (a.genres.length ? a.genres.join(", ") : "unknown")));
-    if (a.description) box.append(el("p", a.description));
-    box.append(el("a", "Open in TIDAL app", {href: a.app_link}));
-    box.append(" · ");
-    box.append(el("a", "Web player", {href: a.web_link, target: "_blank"}));
+    meta.append(el("span", "Released " + a.date));
+    if (a.quality) meta.append(el("span", a.quality));
+    head.append(meta);
+    box.append(head);
+    const genres = el("div", "", {class: "genres"});
+    if (a.genres.length) for (const g of a.genres) genres.append(el("span", g, {class: "genre"}));
+    else genres.append(el("span", "Genre unknown", {class: "genre"}));
+    box.append(genres);
+    if (a.description) box.append(el("p", a.description, {class: "desc"}));
+    const links = el("div", "", {class: "links"});
+    links.append(el("a", "Open in TIDAL app", {href: a.app_link}));
+    links.append(el("a", "Web player", {href: a.web_link, target: "_blank", rel: "noopener"}));
+    if (a.spotify_link) links.append(el("a", "Open in Spotify", {href: a.spotify_link, target: "_blank", rel: "noopener", class: "spotify"}));
+    box.append(links);
     li.append(box);
     list.append(li);
   }
 }
+// Filter panel toggle (phone only; always open on wide screens)
+$("filter-toggle").addEventListener("click", () => {
+  const open = document.querySelector(".filters").classList.toggle("open");
+  $("filter-toggle").setAttribute("aria-expanded", open);
+});
+// Theme toggle: explicit choice is saved; without one the OS setting applies
+const root = document.documentElement;
+const isDark = () => root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+const syncIcon = () => { $("theme").textContent = isDark() ? "☀" : "☾"; };
+$("theme").addEventListener("click", () => {
+  const next = isDark() ? "light" : "dark";
+  root.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch (e) {}
+  syncIcon();
+});
+syncIcon();
 document.querySelectorAll(".filters input, .filters select").forEach(i => i.addEventListener("input", render));
 render();
 </script>
